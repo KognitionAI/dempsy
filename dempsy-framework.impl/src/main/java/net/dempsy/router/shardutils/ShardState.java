@@ -3,6 +3,7 @@ package net.dempsy.router.shardutils;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.IntConsumer;
@@ -15,6 +16,7 @@ import org.slf4j.LoggerFactory;
 import net.dempsy.Infrastructure;
 import net.dempsy.cluster.ClusterInfoException;
 import net.dempsy.router.shardutils.Utils.ShardAssignment;
+import net.dempsy.util.executor.AutoDisposeSingleThreadScheduler;
 import net.dempsy.utils.PersistentTask;
 
 public class ShardState<C> extends PersistentTask {
@@ -28,6 +30,17 @@ public class ShardState<C> extends PersistentTask {
     private final IntConsumer setMask;
     private int mask = 0;
 
+    /**
+     * Periodic safety-net interval for re-checking shard assignments. ZooKeeper
+     * watches are one-shot — if a watch fires during a window where the Leader
+     * hasn't written new assignments yet (e.g. Leader election in progress),
+     * the ShardState can get stuck with stale destinations permanently.
+     * This periodic re-check closes that gap.
+     */
+    private static final long RECHECK_INTERVAL_MS = 30_000L;
+    private final AtomicBoolean isRunning;
+    private final AutoDisposeSingleThreadScheduler scheduler;
+
     public ShardState(final String groupName, final Infrastructure infra, final AtomicBoolean isRunning, final IntFunction<C[]> newArraySupplier,
             final IntConsumer setMask) {
         super(LOGGER, isRunning, infra.getScheduler(), 500);
@@ -36,7 +49,25 @@ public class ShardState<C> extends PersistentTask {
         this.thisNodeId = infra.getNodeId();
         this.newArraySupplier = newArraySupplier;
         this.setMask = setMask;
+        this.isRunning = isRunning;
+        this.scheduler = infra.getScheduler();
         process();
+    }
+
+    /**
+     * Schedules a delayed re-check of shard assignments as a safety net.
+     * Each successful execute() schedules the next re-check, forming a
+     * self-sustaining chain that runs independently of ZK watchers.
+     */
+    private void schedulePeriodicRecheck() {
+        if(isRunning.get()) {
+            scheduler.schedule(() -> {
+                if(isRunning.get()) {
+                    LOGGER.trace("Periodic shard assignment re-check for {}", groupName);
+                    process();
+                }
+            }, RECHECK_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        }
     }
 
     public AtomicReference<C[]> getShardContentsArray() {
@@ -88,6 +119,13 @@ public class ShardState<C> extends PersistentTask {
                 }
             }
             this.destinations.set(newState);
+
+            // Schedule a periodic re-check as a safety net. ZK watches are one-shot
+            // and can be consumed during a window where the Leader hasn't yet written
+            // updated shard assignments (e.g. during leader election after a node crash).
+            // Without this, stale destinations persist indefinitely.
+            schedulePeriodicRecheck();
+
             return true;
         } catch (final ClusterInfoException cie) {
             throw new RuntimeException(cie);

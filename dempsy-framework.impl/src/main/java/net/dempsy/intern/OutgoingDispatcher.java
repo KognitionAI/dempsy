@@ -195,6 +195,14 @@ public class OutgoingDispatcher extends Dispatcher implements Service {
                             // routing layer, which will get the updated address from ZooKeeper.
                             LOGGER.warn("[{}] Send to {} failed, evicting stale sender: {}", thisNodeId, curNode, mte.getMessage());
                             cur.removeSender(curNode);
+
+                            // Trigger a topology re-check. The RoutingStrategy.Router may still be
+                            // returning the dead NodeAddress from stale ZooKeeper state (e.g. the
+                            // ephemeral node hasn't expired yet, or the one-shot watcher was consumed
+                            // before the shard reassignment was written). Forcing the checkup ensures
+                            // the OutgoingDispatcher picks up any pending topology changes promptly
+                            // rather than waiting for a ZK watcher that may never fire.
+                            checkup.process();
                         }
                     }
                 }
