@@ -3,6 +3,7 @@ package net.dempsy.router.simple;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -16,6 +17,7 @@ import net.dempsy.config.ClusterId;
 import net.dempsy.messages.KeyedMessageWithType;
 import net.dempsy.router.RoutingStrategy;
 import net.dempsy.router.RoutingStrategy.ContainerAddress;
+import net.dempsy.util.executor.AutoDisposeSingleThreadScheduler;
 import net.dempsy.utils.PersistentTask;
 
 /**
@@ -24,12 +26,14 @@ import net.dempsy.utils.PersistentTask;
 public class SimpleRoutingStrategy implements RoutingStrategy.Router {
     private static final Logger LOGGER = LoggerFactory.getLogger(SimpleRoutingStrategy.class);
     private static final long RETRY_TIMEOUT = 500L;
+    private static final long RECHECK_INTERVAL_MS = 30_000L;
 
     private String rootDir;
 
     private transient AtomicBoolean isRunning = new AtomicBoolean(false);
     private transient ClusterInfoSession session;
     private transient PersistentTask keepUpToDate;
+    private transient AutoDisposeSingleThreadScheduler scheduler;
 
     final ClusterId clusterId;
     private final SimpleRoutingStrategyFactory factory;
@@ -43,6 +47,7 @@ public class SimpleRoutingStrategy implements RoutingStrategy.Router {
         this.session = infra.getCollaborator();
         this.rootDir = infra.getRootPaths().clustersDir + "/" + clusterId.clusterName;
         this.isRunning = new AtomicBoolean(false);
+        this.scheduler = infra.getScheduler();
 
         this.keepUpToDate = new PersistentTask(LOGGER, isRunning, infra.getScheduler(), RETRY_TIMEOUT) {
 
@@ -71,6 +76,7 @@ public class SimpleRoutingStrategy implements RoutingStrategy.Router {
 
                         address.set(addr);
                         isReady.set(true);
+                        schedulePeriodicRecheck();
                         return true;
                     }
 
@@ -88,6 +94,22 @@ public class SimpleRoutingStrategy implements RoutingStrategy.Router {
 
         isRunning.set(true);
         keepUpToDate.process();
+    }
+
+    /**
+     * Safety net: periodically re-check the cluster directory in case a ZK
+     * one-shot watcher was consumed before the new node registered. Without
+     * this, the Router can be stuck pointing at a dead address permanently.
+     */
+    private void schedulePeriodicRecheck() {
+        if(isRunning.get()) {
+            scheduler.schedule(() -> {
+                if(isRunning.get()) {
+                    LOGGER.trace("Periodic destination re-check for {}", clusterId);
+                    keepUpToDate.process();
+                }
+            }, RECHECK_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        }
     }
 
     @Override
