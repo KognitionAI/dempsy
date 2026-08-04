@@ -3,7 +3,6 @@ package net.dempsy.router.group;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -51,7 +50,6 @@ public class ClusterGroupRouter implements Router, IntConsumer {
     private final ShardState<GroupDetails> state;
     private final Utils<GroupDetails> utils;
     private int mask = 0;
-    private int containerIndex = -1;
 
     ClusterGroupRouter(final ClusterGroupRouterFactory mom, final ClusterId clusterId, final Infrastructure infra, final String groupName) {
         this.mommy = mom;
@@ -77,29 +75,33 @@ public class ClusterGroupRouter implements Router, IntConsumer {
             throw new DempsyException("It appears the " + ClusterGroupRouter.class.getSimpleName() + " strategy for the message key " +
                 SafeString.objectDescription(message != null ? message.key : null)
                 + " is being used prior to initialization or after a failure.");
-        if(containerIndex < 0) {
-            containerIndex = getIndex(destinations, clusterName);
-            if(containerIndex < 0)
-                return null;
-        }
-
         final GroupDetails cur = destinations[utils.determineShard(message.key, mask)];
-        return cur.containerAddresses[containerIndex];
+        if(cur == null)
+            return null;
+
+        // Resolve this cluster's container index from the same GroupDetails the address
+        // comes from. Never cache the index across calls: when the destination node
+        // restarts with a different group composition (clusters added/removed) the
+        // indices shift, and a cached index silently routes messages to the wrong
+        // container (see: sampling messages delivered to unrelated MPs after a
+        // downstream pod restart).
+        final Integer ci = cur.clusterIndicies.get(clusterName);
+        if(ci == null)
+            return null;
+        return cur.containerAddresses[ci.intValue()];
     }
 
     @Override
     public Collection<ContainerAddress> allDesintations() {
         final GroupDetails[] cur = destinations.get();
-        if(containerIndex < 0) {
-            containerIndex = getIndex(cur, clusterName);
-            if(containerIndex < 0)
-                return Collections.emptyList();
-        }
         if(cur == null)
             return new ArrayList<>();
         return new ArrayList<>(Arrays.stream(cur)
             .filter(gd -> gd != null)
-            .map(gd -> gd.containerAddresses[containerIndex])
+            .map(gd -> {
+                final Integer ci = gd.clusterIndicies.get(clusterName);
+                return ci == null ? null : gd.containerAddresses[ci.intValue()];
+            })
             .filter(ca -> ca != null)
             .collect(Collectors.toSet()));
     }
