@@ -17,6 +17,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
@@ -292,11 +293,26 @@ public class OrderedPerContainerThreadingModel implements ThreadingModel {
             thread.interrupt();
         }
 
+        /**
+         * Wait (bounded) for this worker's thread to terminate after {@link #stop()} was called.
+         * If it's still alive after the timeout we log a warning so a hung shutdown is visible
+         * in the logs rather than manifesting as a silently non-exiting JVM.
+         */
+        private void waitForTermination(final long millis) {
+            ignore(() -> thread.join(millis));
+            if(thread.isAlive())
+                LOGGER.warn("Container worker thread \"{}\" is still alive {}ms after being stopped. " +
+                    "It's likely blocked in message processor code.", thread.getName(), millis);
+        }
+
         @Override
         public void run() {
             while(!isStopped.get()) {
                 try {
-                    final ContainerJobHolder job = queue.take();
+                    // A bounded poll (rather than a blocking take()) guarantees this loop re-checks
+                    // isStopped within a bounded amount of time even if the shutdown interrupt gets
+                    // consumed/swallowed inside message processor code while a job is executing.
+                    final ContainerJobHolder job = queue.poll(1, TimeUnit.SECONDS);
                     if(job != null) {
                         // the "- 1" is because this job is being counted as on the
                         // queue right now until I either reject or process it. BUT
@@ -510,8 +526,13 @@ public class OrderedPerContainerThreadingModel implements ThreadingModel {
         if(!calcContainersWork.isTerminated())
             calcContainersWork.shutdownNow();
 
-        if(shuttler != null)
+        if(shuttler != null) {
+            // interrupt all of the container worker threads first ...
             shuttler.containerWorkers.values().forEach(cw -> cw.stop());
+            // ... then wait (bounded) for them to actually terminate so that close() returning
+            // means the threading model's non-daemon threads are gone (or a warning was logged).
+            shuttler.containerWorkers.values().forEach(cw -> cw.waitForTermination(2000));
+        }
     }
 
     @Override
